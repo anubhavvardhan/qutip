@@ -50,16 +50,27 @@ import scipy.linalg as la
 from scipy.sparse.linalg import (use_solver, splu, spilu, spsolve, eigs,
                                  LinearOperator, gmres, lgmres, bicgstab)
 from qutip.qobj import Qobj, issuper, isoper
-from qutip.superoperator import liouvillian, vec2mat
+
+from qutip.superoperator import liouvillian, vec2mat, spre
 from qutip.sparse import sp_permute, sp_bandwidth, sp_reshape, sp_profile
+
+from qutip.superoperator import liouvillian, vec2mat
+from qutip.sparse import (sp_permute, sp_bandwidth, sp_reshape, 
+                            sp_profile)
+from qutip.cy.spmath import zcsr_kron
 from qutip.graph import reverse_cuthill_mckee, weighted_bipartite_matching
 from qutip import (mat2vec, tensor, identity, operator_to_vector)
 import qutip.settings as settings
 from qutip.utilities import _version2int
-import qutip.logging_utils
+from qutip.cy.spconvert import dense2D_to_fastcsr_fmode
 
+import qutip.logging_utils
 logger = qutip.logging_utils.get_logger()
 logger.setLevel('DEBUG')
+
+# Load MKL spsolve if avaiable
+if settings.has_mkl:
+    from qutip._mkl.spsolve import (mkl_splu, mkl_spsolve)
 
 # test if scipy is recent enought to get L & U factors from superLU
 _scipy_check = _version2int(scipy.__version__) >= _version2int('0.14.0')
@@ -76,12 +87,12 @@ def _empty_info_dict():
 
 def _default_steadystate_args():
     def_args = {'method': 'direct', 'sparse': True, 'use_rcm': False,
-                'use_wbm': False, 'use_umfpack': False, 'weight': None,
-                'use_precond': False, 'all_states': False,
-                'M': None, 'x0': None, 'drop_tol': 1e-4, 'fill_factor': 100,
-                'diag_pivot_thresh': None, 'maxiter': 1000, 'tol': 1e-12,
-                'permc_spec': 'COLAMD', 'ILU_MILU': 'smilu_2', 'restart': 20,
-                'return_info': False, 'info': _empty_info_dict()}
+                'use_wbm': False, 'weight': None, 'use_precond': False, 
+                'all_states': False, 'M': None, 'x0': None, 'drop_tol': 1e-4, 
+                'fill_factor': 100, 'diag_pivot_thresh': None, 'maxiter': 1000, 
+                'tol': 1e-12, 'permc_spec': 'COLAMD', 'ILU_MILU': 'smilu_2', 
+                'restart': 20, 'return_info': False, 'info': _empty_info_dict(), 
+                'verbose': False}
 
     return def_args
 
@@ -109,9 +120,9 @@ def steadystate(A, c_op_list=[], **kwargs):
         'direct' (default), sparse eigenvalue problem 'eigen',
         iterative GMRES method 'iterative-gmres', iterative LGMRES method
         'iterative-lgmres', iterative BICGSTAB method 'iterative-bicgstab',
-         SVD 'svd' (dense), or inverse-power method 'power'. The iterative
-         power methods 'power-gmres', 'power-lgmres', 'power-bicgstab' use
-         the same solvers as their direct counterparts.
+        SVD 'svd' (dense), or inverse-power method 'power'. The iterative
+        power methods 'power-gmres', 'power-lgmres', 'power-bicgstab' use
+        the same solvers as their direct counterparts.
 
     return_info : bool, optional, default = False
         Return a dictionary of solver-specific infomation about the
@@ -135,10 +146,6 @@ def steadystate(A, c_op_list=[], **kwargs):
         Sets the size of the elements used for adding the unity trace condition
         to the linear solvers.  This is set to the average abs value of the
         Liouvillian elements if not specified by the user.
-
-    use_umfpack : bool {False, True}
-        Use umfpack solver instead of SuperLU.  For SciPy 0.14+, this option
-        requires installing scikits.umfpack.
 
     x0 : ndarray, optional
         ITERATIVE ONLY. Initial guess for solution vector.
@@ -193,14 +200,13 @@ def steadystate(A, c_op_list=[], **kwargs):
     -------
     dm : qobj
         Steady state density matrix.
-
     info : dict, optional
         Dictionary containing solver-specific information about the solution.
 
     Notes
     -----
     The SVD method works only for dense operators (i.e. small systems).
-
+    
     """
     ss_args = _default_steadystate_args()
     for key in kwargs.keys():
@@ -264,17 +270,25 @@ def _steadystate_setup(A, c_op_list):
                         'Liouvillian (super) operators')
 
 
-def _steadystate_LU_liouvillian(L, ss_args):
+def _steadystate_LU_liouvillian(L, ss_args, has_mkl=0):
     """Creates modified Liouvillian for LU based SS methods.
     """
     perm = None
     perm2 = None
     rev_perm = None
     n = int(np.sqrt(L.shape[0]))
-    L = L.data.tocsc() + sp.csc_matrix(
-        (ss_args['weight']*np.ones(n), (np.zeros(n), [nn * (n + 1)
-         for nn in range(n)])),
-        shape=(n ** 2, n ** 2))
+    form = 'csr'
+    if has_mkl:
+        L = L.data + sp.csr_matrix(
+            (ss_args['weight']*np.ones(n), (np.zeros(n), [nn * (n + 1)
+             for nn in range(n)])),
+             shape=(n ** 2, n ** 2))
+    else:
+        form = 'csc'
+        L = L.data.tocsc() + sp.csc_matrix(
+            (ss_args['weight']*np.ones(n), (np.zeros(n), [nn * (n + 1)
+             for nn in range(n)])),
+             shape=(n ** 2, n ** 2))
 
     if settings.debug:
         old_band = sp_bandwidth(L)[0]
@@ -289,7 +303,7 @@ def _steadystate_LU_liouvillian(L, ss_args):
         _wbm_start = time.time()
         perm = weighted_bipartite_matching(L)
         _wbm_end = time.time()
-        L = sp_permute(L, perm, [], 'csc')
+        L = sp_permute(L, perm, [], form)
         ss_args['info']['perm'].append('wbm')
         ss_args['info']['wbm_time'] = _wbm_end-_wbm_start
         if settings.debug:
@@ -303,7 +317,7 @@ def _steadystate_LU_liouvillian(L, ss_args):
         perm2 = reverse_cuthill_mckee(L)
         _rcm_end = time.time()
         rev_perm = np.argsort(perm2)
-        L = sp_permute(L, perm2, perm2, 'csc')
+        L = sp_permute(L, perm2, perm2, form)
         ss_args['info']['perm'].append('rcm')
         ss_args['info']['rcm_time'] = _rcm_end-_rcm_start
         if settings.debug:
@@ -318,15 +332,14 @@ def _steadystate_LU_liouvillian(L, ss_args):
     return L, perm, perm2, rev_perm, ss_args
 
 
-def steady(L, maxiter=10, tol=1e-12, itertol=1e-15, method='solve',
-           use_umfpack=False, use_precond=False):
+def steady(L, maxiter=10, tol=1e-12, itertol=1e-15, method='solve', 
+            use_precond=False):
     """
     Deprecated. See steadystate instead.
     """
     message = "steady has been deprecated, use steadystate instead"
     warnings.warn(message, DeprecationWarning)
-    return steadystate(L, [], maxiter=maxiter, tol=tol,
-                       use_umfpack=use_umfpack, use_precond=use_precond)
+    return steadystate(L, [], maxiter=maxiter, tol=tol, use_precond=use_precond)
 
 
 def _steadystate_direct_sparse(L, ss_args):
@@ -341,20 +354,24 @@ def _steadystate_direct_sparse(L, ss_args):
     b = np.zeros(n ** 2, dtype=complex)
     b[0] = ss_args['weight']
 
-    L, perm, perm2, rev_perm, ss_args = _steadystate_LU_liouvillian(L, ss_args)
+    if settings.has_mkl:
+        has_mkl = 1
+    else:
+        has_mkl = 0
+    
+    L, perm, perm2, rev_perm, ss_args = _steadystate_LU_liouvillian(L, ss_args, has_mkl)
     if np.any(perm):
         b = b[np.ix_(perm,)]
     if np.any(perm2):
         b = b[np.ix_(perm2,)]
 
-    use_solver(assumeSortedIndices=True, useUmfpack=ss_args['use_umfpack'])
     ss_args['info']['permc_spec'] = ss_args['permc_spec']
     ss_args['info']['drop_tol'] = ss_args['drop_tol']
     ss_args['info']['diag_pivot_thresh'] = ss_args['diag_pivot_thresh']
     ss_args['info']['fill_factor'] = ss_args['fill_factor']
     ss_args['info']['ILU_MILU'] = ss_args['ILU_MILU']
 
-    if not ss_args['use_umfpack']:
+    if not has_mkl:
         # Use superLU solver
         orig_nnz = L.nnz
         _direct_start = time.time()
@@ -374,21 +391,24 @@ def _steadystate_direct_sparse(L, ss_args):
                 logger.debug('L NNZ: %i ; U NNZ: %i' % (L_nnz, U_nnz))
                 logger.debug('Fill factor: %f' % ((L_nnz + U_nnz)/orig_nnz))
 
-    else:
-        # Use umfpack solver
+    else: # Use MKL solver
+        if len(ss_args['info']['perm']) !=0:
+            in_perm = np.arange(n**2, dtype=np.int32)
+        else:
+            in_perm = None
         _direct_start = time.time()
-        v = spsolve(L, b)
+        v = mkl_spsolve(L, b, perm = in_perm, verbose = ss_args['verbose'])
         _direct_end = time.time()
         ss_args['info']['solution_time'] = _direct_end-_direct_start
 
     if ss_args['return_info']:
         ss_args['info']['residual_norm'] = la.norm(b - L*v)
 
-    if (not ss_args['use_umfpack']) and ss_args['use_rcm']:
+    if ss_args['use_rcm']:
         v = v[np.ix_(rev_perm,)]
 
-    data = vec2mat(v)
-    data = 0.5 * (data + data.conj().T)
+    data = dense2D_to_fastcsr_fmode(vec2mat(v), n, n)
+    data = 0.5 * (data + data.H)
     if ss_args['return_info']:
         return Qobj(data, dims=dims, isherm=True), ss_args['info']
     else:
@@ -458,9 +478,9 @@ def _steadystate_eigen(L, ss_args):
         ss_args['info']['residual_norm'] = la.norm(L*eigvec)
     if ss_args['use_rcm']:
         eigvec = eigvec[np.ix_(rev_perm,)]
-
-    data = vec2mat(eigvec)
-    data = 0.5 * (data + data.conj().T)
+    _temp = vec2mat(eigvec)
+    data = dense2D_to_fastcsr_fmode(_temp,_temp.shape[0], _temp.shape[1])
+    data = 0.5 * (data + data.H)
     out = Qobj(data, dims=dims, isherm=True)
     if ss_args['return_info']:
         return out/out.tr(), ss_args['info']
@@ -545,7 +565,7 @@ def _steadystate_iterative(L, ss_args):
     if np.any(perm2):
         b = b[np.ix_(perm2,)]
 
-    use_solver(assumeSortedIndices=True, useUmfpack=ss_args['use_umfpack'])
+    use_solver(assumeSortedIndices=True)
 
     if ss_args['M'] is None and ss_args['use_precond']:
         ss_args['M'], ss_args = _iterative_precondition(L, n, ss_args)
@@ -642,14 +662,19 @@ def _steadystate_svd_dense(L, ss_args):
         return rhoss / rhoss.tr()
 
 
-def _steadystate_power_liouvillian(L, ss_args):
+def _steadystate_power_liouvillian(L, ss_args, has_mkl=0):
     """Creates modified Liouvillian for power based SS methods.
     """
     perm = None
     perm2 = None
     rev_perm = None
     n = L.shape[0]
-    L = L.data.tocsc() - (1e-15) * sp.eye(n, n, format='csc')
+    if has_mkl:
+        L = L.data - (1e-15) * sp.eye(n, n, format='csr')
+        kind = 'csr'
+    else:
+        L = L.data.tocsc() - (1e-15) * sp.eye(n, n, format='csc')
+        kind = 'csc'
     orig_nnz = L.nnz
     if settings.debug:
         old_band = sp_bandwidth(L)[0]
@@ -663,7 +688,7 @@ def _steadystate_power_liouvillian(L, ss_args):
         _wbm_start = time.time()
         perm = weighted_bipartite_matching(L)
         _wbm_end = time.time()
-        L = sp_permute(L, perm, [], 'csc')
+        L = sp_permute(L, perm, [], kind)
         ss_args['info']['perm'].append('wbm')
         ss_args['info']['wbm_time'] = _wbm_end-_wbm_start
         if settings.debug:
@@ -681,7 +706,7 @@ def _steadystate_power_liouvillian(L, ss_args):
         _rcm_end = time.time()
         ss_args['info']['rcm_time'] = _rcm_end-_rcm_start
         rev_perm = np.argsort(perm2)
-        L = sp_permute(L, perm2, perm2, 'csc')
+        L = sp_permute(L, perm2, perm2, kind)
         if settings.debug:
             new_band = sp_bandwidth(L)[0]
             new_pro = sp_profile(L)[0]
@@ -713,7 +738,12 @@ def _steadystate_power(L, ss_args):
         rhoss.dims = [L.dims[0], 1]
     n = L.shape[0]
     # Build Liouvillian
-    L, perm, perm2, rev_perm, ss_args = _steadystate_power_liouvillian(L, ss_args)
+    if settings.has_mkl and ss_args['method'] == 'power':
+        has_mkl = 1
+    else:
+        has_mkl = 0
+    L, perm, perm2, rev_perm, ss_args = _steadystate_power_liouvillian(L, 
+                                                ss_args, has_mkl)
     orig_nnz = L.nnz
     # start with all ones as RHS
     v = np.ones(n, dtype=complex)
@@ -738,15 +768,18 @@ def _steadystate_power(L, ss_args):
     _power_start = time.time()
     # Get LU factors
     if ss_args['method'] == 'power':
-        lu = splu(L, permc_spec=ss_args['permc_spec'],
+        if settings.has_mkl:
+            lu = mkl_splu(L)
+        else: 
+            lu = splu(L, permc_spec=ss_args['permc_spec'],
               diag_pivot_thresh=ss_args['diag_pivot_thresh'],
               options=dict(ILU_MILU=ss_args['ILU_MILU']))
 
-        if settings.debug and _scipy_check:
-            L_nnz = lu.L.nnz
-            U_nnz = lu.U.nnz
-            logger.debug('L NNZ: %i ; U NNZ: %i' % (L_nnz, U_nnz))
-            logger.debug('Fill factor: %f' % ((L_nnz+U_nnz)/orig_nnz))
+            if settings.debug and _scipy_check:
+                L_nnz = lu.L.nnz
+                U_nnz = lu.U.nnz
+                logger.debug('L NNZ: %i ; U NNZ: %i' % (L_nnz, U_nnz))
+                logger.debug('Fill factor: %f' % ((L_nnz+U_nnz)/orig_nnz))
 
     it = 0
     _tol = max(ss_args['tol']/10, 1e-15) # Should make this user accessible
@@ -771,10 +804,11 @@ def _steadystate_power(L, ss_args):
             
         v = v / la.norm(v, np.inf)
         it += 1
+    if ss_args['method'] == 'power' and settings.has_mkl:
+        lu.delete()
     if it >= maxiter:
         raise Exception('Failed to find steady state after ' +
                         str(maxiter) + ' iterations')
-
     _power_end = time.time()
     ss_args['info']['solution_time'] = _power_end-_power_start
     ss_args['info']['iterations'] = it
@@ -788,14 +822,13 @@ def _steadystate_power(L, ss_args):
 
     # normalise according to type of problem
     if sflag:
-        trow = sp.eye(rhoss.shape[0], rhoss.shape[0], format='coo')
-        trow = sp_reshape(trow, (1, n))
-        data = v / sum(trow.dot(v))
+        trow = v[::rhoss.shape[0]+1]
+        data = v / np.sum(trow)
     else:
         data = data / la.norm(v)
 
-    data = sp.csr_matrix(vec2mat(data))
-    rhoss.data = 0.5 * (data + data.conj().T)
+    data = dense2D_to_fastcsr_fmode(vec2mat(data), rhoss.shape[0], rhoss.shape[0])
+    rhoss.data = 0.5 * (data + data.H)
     rhoss.isherm = True
     if ss_args['return_info']:
         return rhoss, ss_args['info']
@@ -908,42 +941,52 @@ def build_preconditioner(A, c_op_list=[], **kwargs):
     else:
         return M
 
-
-def _pseudo_inverse_dense(L, rhoss, method='direct', **pseudo_args):
+def _pseudo_inverse_dense(L, rhoss, w=None, **pseudo_args):
     """
     Internal function for computing the pseudo inverse of an Liouvillian using
     dense matrix methods. See pseudo_inverse for details.
     """
-    if method == 'direct':
-        rho_vec = np.transpose(mat2vec(rhoss.full()))
+    rho_vec = np.transpose(mat2vec(rhoss.full()))
 
-        tr_mat = tensor([identity(n) for n in L.dims[0][0]])
-        tr_vec = np.transpose(mat2vec(tr_mat.full()))
-
-        N = np.prod(L.dims[0][0])
-        I = np.identity(N * N)
-        P = np.kron(np.transpose(rho_vec), tr_vec)
-        Q = I - P
-        LIQ = np.linalg.solve(L.full(), Q)
+    tr_mat = tensor([identity(n) for n in L.dims[0][0]])
+    tr_vec = np.transpose(mat2vec(tr_mat.full()))
+    N = np.prod(L.dims[0][0])
+    I = np.identity(N * N)
+    P = np.kron(np.transpose(rho_vec), tr_vec)
+    Q = I - P
+    
+    if w is None:
+        L = L
+    else:
+        L = 1.0j*w*spre(tr_mat)+L
+    
+    if pseudo_args['method'] == 'direct':
+        try:
+            LIQ = np.linalg.solve(L.full(), Q)
+        except:
+            LIQ = np.linalg.lstsq(L.full(), Q)[0]
+         
         R = np.dot(Q, LIQ)
-
+     
         return Qobj(R, dims=L.dims)
 
-    elif method == 'numpy':
-        return Qobj(np.linalg.pinv(L.full()), dims=L.dims)
+    elif pseudo_args['method'] == 'numpy':
+        return Qobj(np.dot(Q,np.dot(np.linalg.pinv(L.full()),Q)), dims=L.dims)
 
-    elif method == 'scipy':
-        return Qobj(la.pinv(L.full()), dims=L.dims)
+    elif pseudo_args['method'] == 'scipy':
+        #return Qobj(la.pinv(L.full()), dims=L.dims)
+        return Qobj(np.dot(Q,np.dot(la.pinv(L.full()),Q)), dims=L.dims)
 
-    elif method == 'scipy2':
-        return Qobj(la.pinv2(L.full()), dims=L.dims)
+    elif pseudo_args['method'] == 'scipy2':
+        #return Qobj(la.pinv2(L.full()), dims=L.dims)
+        return Qobj(np.dot(Q,np.dot(la.pinv2(L.full()),Q)), dims=L.dims)
 
     else:
         raise ValueError("Unsupported method '%s'. Use 'direct' or 'numpy'" %
                          method)
 
 
-def _pseudo_inverse_sparse(L, rhoss, method='splu', **pseudo_args):
+def _pseudo_inverse_sparse(L, rhoss, w=None, **pseudo_args):
     """
     Internal function for computing the pseudo inverse of an Liouvillian using
     sparse matrix methods. See pseudo_inverse for details.
@@ -956,47 +999,65 @@ def _pseudo_inverse_sparse(L, rhoss, method='splu', **pseudo_args):
     tr_op = tensor([identity(n) for n in L.dims[0][0]])
     tr_op_vec = operator_to_vector(tr_op)
 
-    P = sp.kron(rhoss_vec.data, tr_op_vec.data.T, format='csc')
-    I = sp.eye(N*N, N*N, format='csc')
+    P = zcsr_kron(rhoss_vec.data, tr_op_vec.data.T)
+    I = sp.eye(N*N, N*N, format='csr')
     Q = I - P
-
+    
+  
+    if w is None:
+        L =  1.0j*(1e-15)*spre(tr_op) + L
+    else:
+        if w != 0.0:
+            L = 1.0j*w*spre(tr_op) + L
+        else:
+            L =  1.0j*(1e-15)*spre(tr_op) + L
+        
+        
     if pseudo_args['use_rcm']:
         perm = reverse_cuthill_mckee(L.data)
-        A = sp_permute(L.data, perm, perm, 'csc').tocsc()
-        Q = sp_permute(Q, perm, perm, 'csc')
+        A = sp_permute(L.data, perm, perm)
+        Q = sp_permute(Q, perm, perm)
     else:
-        A = L.data.tocsc()
-        A.sort_indices()
-
-    if method == 'spsolve':
-        sp.linalg.use_solver(assumeSortedIndices=True, useUmfpack=use_umfpack)
-        LIQ = sp.linalg.spsolve(A, Q)
-
-    elif method == 'splu':
-        lu = sp.linalg.splu(A, permc_spec=pseudo_args['permc_spec'],
+        if not settings.has_mkl:
+            A = L.data.tocsc()
+            A.sort_indices()
+        
+        
+    
+    if pseudo_args['method'] == 'splu':
+        if settings.has_mkl:
+            A = L.data.tocsr()
+            A.sort_indices()
+            LIQ = mkl_spsolve(A,Q.toarray())
+        else:
+       
+            lu = sp.linalg.splu(A, permc_spec=pseudo_args['permc_spec'],
                             diag_pivot_thresh=pseudo_args['diag_pivot_thresh'],
                             options=dict(ILU_MILU=pseudo_args['ILU_MILU']))
-        LIQ = lu.solve(Q.toarray())
-
-    elif method == 'spilu':
+            LIQ = lu.solve(Q.toarray())
+         
+            
+    elif pseudo_args['method'] == 'spilu':
+        
         lu = sp.linalg.spilu(A, permc_spec=pseudo_args['permc_spec'],
                              fill_factor=pseudo_args['fill_factor'], 
                              drop_tol=pseudo_args['drop_tol'])
         LIQ = lu.solve(Q.toarray())
 
+
     else:
         raise ValueError("unsupported method '%s'" % method)
 
-    R = sp.csc_matrix(Q * LIQ)
+    R = sp.csr_matrix(Q * LIQ)
 
     if pseudo_args['use_rcm']:
         rev_perm = np.argsort(perm)
-        R = sp_permute(R, rev_perm, rev_perm, 'csc')
+        R = sp_permute(R, rev_perm, rev_perm, 'csr')
 
     return Qobj(R, dims=L.dims)
 
 
-def pseudo_inverse(L, rhoss=None, sparse=True, method='splu', **kwargs):
+def pseudo_inverse(L, rhoss=None, w=None, sparse=True,  **kwargs):
     """
     Compute the pseudo inverse for a Liouvillian superoperator, optionally
     given its steady state density matrix (which will be computed if not given).
@@ -1005,10 +1066,15 @@ def pseudo_inverse(L, rhoss=None, sparse=True, method='splu', **kwargs):
     -------
     L : Qobj
         A Liouvillian superoperator for which to compute the pseudo inverse.
-
+    
+    
     rhoss : Qobj
         A steadystate density matrix as Qobj instance, for the Liouvillian
         superoperator L.
+        
+    w : double
+        frequency at which to evaluate pseudo-inverse.  Can be zero for dense systems
+        and large sparse systems. Small sparse systems can fail for zero frequencies.
 
     sparse : bool
         Flag that indicate whether to use sparse or dense matrix methods when
@@ -1032,7 +1098,13 @@ def pseudo_inverse(L, rhoss=None, sparse=True, method='splu', **kwargs):
     In general the inverse of a sparse matrix will be dense.  If you
     are applying the inverse to a density matrix then it is better to
     cast the problem as an Ax=b type problem where the explicit calculation
-    of the inverse is not required.
+    of the inverse is not required. See page 67 of "Electrons in nanostructures"
+    C. Flindt, PhD Thesis available online:
+    http://orbit.dtu.dk/fedora/objects/orbit:82314/datastreams/file_4732600/content
+    
+    Note also that the definition of the pseudo-inverse herein is different
+    from numpys pinv() alone, as it includes pre and post projection onto 
+    the subspace defined by the projector Q.
     
     """
     pseudo_args = _default_steadystate_args()
@@ -1042,7 +1114,9 @@ def pseudo_inverse(L, rhoss=None, sparse=True, method='splu', **kwargs):
         else:
             raise Exception(
                 "Invalid keyword argument '"+key+"' passed to pseudo_inverse.")
-
+    if 'method' not in kwargs.keys():
+        pseudo_args['method']='splu'
+        
     # Set column perm to NATURAL if using RCM and not specified by user
     if pseudo_args['use_rcm'] and ('permc_spec' not in kwargs.keys()):
         pseudo_args['permc_spec'] = 'NATURAL'
@@ -1051,7 +1125,7 @@ def pseudo_inverse(L, rhoss=None, sparse=True, method='splu', **kwargs):
         rhoss = steadystate(L, **pseudo_args)
 
     if sparse:
-        return _pseudo_inverse_sparse(L, rhoss, method=method, **pseudo_args)
+        return _pseudo_inverse_sparse(L,rhoss, w=w,  **pseudo_args)
     else:
-        method = method if method != 'splu' else 'direct'
-        return _pseudo_inverse_dense(L, rhoss, method=method, **pseudo_args)
+        pseudo_args['method'] = pseudo_args['method'] if pseudo_args['method'] != 'splu' else 'direct'
+        return _pseudo_inverse_dense(L, rhoss, w=w, **pseudo_args)

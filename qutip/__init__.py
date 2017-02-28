@@ -113,14 +113,10 @@ try:
               ("(%s), requiring %s." %
                (Cython.__version__, _cython_requirement)))
 
-    import pyximport
-    os.environ['CFLAGS'] = '-O3 -w -ffast-math -march=native'
-    pyximport.install(setup_args={'include_dirs': [numpy.get_include()]})
-
 except Exception as e:
     print("QuTiP warning: Cython setup failed: " + str(e))
 else:
-    del Cython, pyximport
+    del Cython
 
 # -----------------------------------------------------------------------------
 # Load user configuration if present: override defaults.
@@ -170,6 +166,11 @@ if qutip.settings.num_cpus == 0:
         qutip.settings.num_cpus = multiprocessing.cpu_count()
 
 
+# Find MKL library if it exists
+import qutip._mkl
+
+
+
 # -----------------------------------------------------------------------------
 # Load configuration from environment variables: override defaults and
 # configuration file.
@@ -183,14 +184,6 @@ except:
 else:
     qutip.settings.fortran = True
 
-# check for scikits.umfpack
-try:
-    import scikits.umfpack as umfpack
-except:
-    qutip.settings.umfpack = False
-else:
-    qutip.settings.umfpack = True
-    del umfpack
 # -----------------------------------------------------------------------------
 # Check that import modules are compatible with requested configuration
 #
@@ -203,11 +196,6 @@ except:
     warnings.warn("matplotlib not found: Graphics will not work.")
 else:
     del matplotlib
-
-# -----------------------------------------------------------------------------
-# Clean name space
-#
-del os, sys, numpy, scipy, multiprocessing
 
 # -----------------------------------------------------------------------------
 # Load modules
@@ -261,6 +249,7 @@ from qutip.correlation import *
 from qutip.countstat import *
 from qutip.rcsolve import *
 from qutip.nonmarkov import *
+from qutip.interpolate import *
 
 # quantum information
 from qutip.qip import *
@@ -270,3 +259,14 @@ from qutip.parallel import *
 from qutip.utilities import *
 from qutip.fileio import *
 from qutip.about import *
+
+# Setup pyximport 
+import pyximport
+os.environ['CFLAGS'] = '-O2 -w -ffast-math'
+pyximport.install(setup_args={'include_dirs': [numpy.get_include()]})
+del pyximport
+
+# -----------------------------------------------------------------------------
+# Clean name space
+#
+del os, sys, numpy, scipy, multiprocessing

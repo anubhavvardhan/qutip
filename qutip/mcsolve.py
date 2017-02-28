@@ -36,7 +36,7 @@ __all__ = ['mcsolve']
 import os
 from types import FunctionType
 import numpy as np
-from numpy.random import RandomState, random_integers
+from numpy.random import RandomState, randint
 from scipy.integrate import ode
 import scipy.sparse as sp
 from scipy.integrate._ode import zvode
@@ -46,12 +46,14 @@ from qutip.parallel import parfor, parallel_map, serial_map
 from qutip.cy.spmatfuncs import cy_ode_rhs, cy_expect_psi_csr, spmv, spmv_csr
 from qutip.cy.codegen import Codegen
 from qutip.cy.utilities import _cython_build_cleanup
-from qutip.solver import Options, Result, config
+from qutip.cy.spconvert import dense2D_to_fastcsr_cmode
+from qutip.solver import Options, Result, config, _solver_safety_check
 from qutip.rhs_generate import _td_format_check, _td_wrap_array_str
+from qutip.interpolate import Cubic_Spline
 from qutip.settings import debug
 from qutip.ui.progressbar import TextProgressBar, BaseProgressBar
+from qutip.fastsparse import csr2fast
 import qutip.settings
-
 
 dznrm2 = get_blas_funcs("znrm2", dtype=np.float64)
 
@@ -79,9 +81,10 @@ class qutip_zvode(zvode):
         return r
 
 
-def mcsolve(H, psi0, tlist, c_ops, e_ops, ntraj=None,
+def mcsolve(H, psi0, tlist, c_ops=[], e_ops=[], ntraj=None,
             args={}, options=None, progress_bar=True,
-            map_func=None, map_kwargs=None):
+            map_func=None, map_kwargs=None,
+            _safe_mode=True):
     """Monte Carlo evolution of a state vector :math:`|\psi \\rangle` for a
     given Hamiltonian and sets of collapse operators, and possibly, operators
     for calculating expectation values. Options for the underlying ODE solver
@@ -178,19 +181,7 @@ def mcsolve(H, psi0, tlist, c_ops, e_ops, ntraj=None,
 
     if debug:
         print(inspect.stack()[0][3])
-
-    if options is None:
-        options = Options()
-
-    if ntraj is None:
-        ntraj = options.ntraj
-
-    config.map_func = map_func if map_func is not None else parallel_map
-    config.map_kwargs = map_kwargs if map_kwargs is not None else {}
-
-    if not psi0.isket:
-        raise Exception("Initial state must be a state vector.")
-
+    
     if isinstance(c_ops, Qobj):
         c_ops = [c_ops]
 
@@ -202,6 +193,21 @@ def mcsolve(H, psi0, tlist, c_ops, e_ops, ntraj=None,
         e_ops = [e for e in e_ops.values()]
     else:
         e_ops_dict = None
+    
+    if _safe_mode:
+        _solver_safety_check(H, psi0, c_ops, e_ops, args)
+    
+    if options is None:
+        options = Options()
+
+    if ntraj is None:
+        ntraj = options.ntraj
+
+    config.map_func = map_func if map_func is not None else parallel_map
+    config.map_kwargs = map_kwargs if map_kwargs is not None else {}
+
+    if not psi0.isket:
+        raise Exception("Initial state must be a state vector.")
 
     config.options = options
 
@@ -387,7 +393,7 @@ class _MC():
             # setup seeds array
             if self.config.options.seeds is None:
                 self.config.options.seeds = \
-                    random_integers(1e8, size=config.ntraj)
+                    randint(1, 100000000.0 + 1, size=config.ntraj)
             else:
                 # if ntraj was reduced but reusing seeds
                 seed_length = len(config.options.seeds)
@@ -396,8 +402,8 @@ class _MC():
                         config.options.seeds[0:config.ntraj]
                 # if ntraj was increased but reusing seeds
                 elif seed_length < config.ntraj:
-                    newseeds = random_integers(
-                        1e8, size=(config.ntraj - seed_length))
+                    newseeds = randint(1, 100000000.0 + 1, 
+                                size=(config.ntraj - seed_length))
                     self.config.options.seeds = np.hstack(
                         (config.options.seeds, newseeds))
 
@@ -484,7 +490,7 @@ def _tdRHStd(t, psi, config):
                  config.n_ops_ptr[j],
                  psi)
         for j in config.c_td_inds])
-    return (const_term - np.sum(h_func_term, 0)
+    return (const_term + np.sum(h_func_term, 0)
             - 0.5 * np.sum(col_func_terms, 0))
 
 
@@ -508,7 +514,7 @@ def _tdRHStd_with_state(t, psi, config):
                  config.n_ops_ptr[j], psi)
         for j in config.c_td_inds])
 
-    return (const_term - np.sum(h_func_term, 0)
+    return (const_term + np.sum(h_func_term, 0)
             - 0.5 * np.sum(col_func_terms, 0))
 
 
@@ -737,10 +743,11 @@ def _mc_alg_evolve(nt, config, opt, seeds):
     temp = sp.csr_matrix(
         np.reshape(config.psi0, (config.psi0.shape[0], 1)),
         dtype=complex)
+    temp = csr2fast(temp)
     if (config.options.average_states and
             not config.options.steady_state_average):
         # output is averaged states, so use dm
-        states_out[0] = Qobj(temp*temp.conj().transpose(),
+        states_out[0] = Qobj(temp*temp.H,
                              [config.psi0_dims[0],
                               config.psi0_dims[0]],
                              [config.psi0_shape[0],
@@ -752,7 +759,7 @@ def _mc_alg_evolve(nt, config, opt, seeds):
         states_out[0] = Qobj(temp, config.psi0_dims,
                              config.psi0_shape, fast='mc')
     elif config.options.steady_state_average:
-        states_out[0] = temp * temp.conj().transpose()
+        states_out[0] = temp * temp.H
 
     # PRE-GENERATE LIST FOR EXPECTATION VALUES
     expect_out = []
@@ -941,13 +948,13 @@ def _mc_alg_evolve(nt, config, opt, seeds):
         # ----------------
         out_psi = ODE._y / dznrm2(ODE._y)
         if config.e_num == 0 or config.options.store_states:
-            out_psi_csr = sp.csr_matrix(np.reshape(out_psi,
+            out_psi_csr = dense2D_to_fastcsr_cmode(np.reshape(out_psi,
                                                    (out_psi.shape[0], 1)),
-                                        dtype=complex)
+                                                   out_psi.shape[0], 1)
             if (config.options.average_states and
                     not config.options.steady_state_average):
                 states_out[k] = Qobj(
-                    out_psi_csr * out_psi_csr.conj().transpose(),
+                    out_psi_csr * out_psi_csr.H,
                     [config.psi0_dims[0], config.psi0_dims[0]],
                     [config.psi0_shape[0], config.psi0_shape[0]],
                     fast='mc-dm')
@@ -955,7 +962,7 @@ def _mc_alg_evolve(nt, config, opt, seeds):
             elif config.options.steady_state_average:
                 states_out[0] = (
                     states_out[0] +
-                    (out_psi_csr * out_psi_csr.conj().transpose()))
+                    (out_psi_csr * out_psi_csr.H))
 
             else:
                 states_out[k] = Qobj(out_psi_csr, config.psi0_dims,
@@ -1074,13 +1081,13 @@ def _mc_data_config(H, psi0, h_stuff, c_ops, c_stuff, args, e_ops,
     if config.tflag == 0:
         # CONSTANT H & C_OPS CODE
         # -----------------------
-
         if config.cflag:
             config.c_const_inds = np.arange(len(c_ops))
+            # combine Hamiltonian and constant collapse terms into one
             for c_op in c_ops:
                 n_op = c_op.dag() * c_op
                 H -= 0.5j * \
-                    n_op  # combine Hamiltonian and collapse terms into one
+                    n_op 
         # construct Hamiltonian data structures
         if options.tidy:
             H = H.tidyup(options.atol)
@@ -1140,7 +1147,7 @@ def _mc_data_config(H, psi0, h_stuff, c_ops, c_stuff, args, e_ops,
             # find inds of constant terms
             H_const_inds = np.setdiff1d(H_inds, H_td_inds)
             # extract time-dependent coefficients (strings or functions)
-            H_tdterms = [H[k][1] for k in H_td_inds]
+            config.h_tdterms = [H[k][1] for k in H_td_inds]
             # combine time-INDEPENDENT terms into one.
             H = np.array([np.sum(H[k] for k in H_const_inds)] +
                          [H[k][0] for k in H_td_inds], dtype=object)
@@ -1223,6 +1230,12 @@ def _mc_data_config(H, psi0, h_stuff, c_ops, c_stuff, args, e_ops,
                               "], config.h_ptr[" + str(k) + "]")
             if k != data_range[-1]:
                 config.string += ","
+        
+        # Add objects to ode args string
+        for k in range(len(config.h_tdterms)):
+            if isinstance(config.h_tdterms[k], Cubic_Spline):
+                config.string += ", config.h_tdterms["+str(k)+"].coeffs"
+        
         # attach args to ode args string
         if len(config.c_args) > 0:
             for kk in range(len(config.c_args)):
@@ -1230,7 +1243,7 @@ def _mc_data_config(H, psi0, h_stuff, c_ops, c_stuff, args, e_ops,
 
         name = "rhs" + str(os.getpid()) + str(config.cgen_num)
         config.tdname = name
-        cgen = Codegen(H_inds, H_tdterms, config.h_td_inds, args,
+        cgen = Codegen(H_inds, config.h_tdterms, config.h_td_inds, args,
                        C_inds, C_tdterms, config.c_td_inds, type='mc',
                        config=config)
         cgen.generate(name + ".pyx")

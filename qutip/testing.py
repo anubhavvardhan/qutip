@@ -30,12 +30,14 @@
 #    (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 #    OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ###############################################################################
-
+from qutip.about import about
 
 def run():
     """
     Run the nose test scripts for QuTiP.
     """
+    # Call about to get all version info printed with tests
+    about()
     import nose
     # runs tests in qutip.tests module only
     nose.run(defaultTest="qutip.tests", argv=['nosetests', '-v'])

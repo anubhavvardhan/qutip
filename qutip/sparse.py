@@ -47,7 +47,10 @@ import scipy.linalg as la
 from scipy.linalg.blas import get_blas_funcs
 _dznrm2 = get_blas_funcs("znrm2")
 from qutip.cy.sparse_utils import (_sparse_profile, _sparse_permute,
-                                   _sparse_reverse_permute, _sparse_bandwidth)
+                                   _sparse_reverse_permute, _sparse_bandwidth,
+                                   _isdiag)
+from qutip.fastsparse import fast_csr_matrix
+from qutip.cy.spconvert import arr_coo2fast
 from qutip.settings import debug
 
 import qutip.logging_utils
@@ -138,18 +141,19 @@ def sp_reshape(A, shape, format='csr'):
 
     flat_indices = ncols * C.row + C.col
     new_row, new_col = divmod(flat_indices, shape[1])
-    B = sp.coo_matrix((C.data, (new_row, new_col)), shape=shape)
 
     if format == 'csr':
-        return B.tocsr()
-    elif format == 'coo':
-        return B
-    elif format == 'csc':
-        return B.tocsc()
-    elif format == 'lil':
-        return B.tolil()
+        return arr_coo2fast(C.data, new_row, new_col, shape[0], shape[1])
     else:
-        raise ValueError('Return format not valid.')
+        B = sp.coo_matrix((C.data, (new_row, new_col)), shape=shape)
+        if format == 'coo':
+            return B
+        elif format == 'csc':
+            return B.tocsc()
+        elif format == 'lil':
+            return B.tolil()
+        else:
+            raise ValueError('Return format not valid.')
 
 
 def _dense_eigs(data, isherm, vecs, N, eigvals, num_large, num_small):
@@ -377,96 +381,20 @@ def sp_eigs(data, isherm, vecs=True, sparse=False, sort='low',
     return (evals, evecs) if vecs else evals
 
 
-def sp_expm(data, sparse=True):
+def sp_expm(A, sparse=False):
     """
-    Sparse matrix exponential.
+    Sparse matrix exponential.    
     """
-    A = data.tocsc()  # extract Qobj data (sparse matrix)
-    m_vals = np.array([3, 5, 7, 9, 13])
-    theta = np.array([0.01495585217958292, 0.2539398330063230,
-                      0.9504178996162932, 2.097847961257068,
-                      5.371920351148152], dtype=float)
-    normA = sp_one_norm(data)
-    if normA <= theta[-1]:
-        for ii in range(len(m_vals)):
-            if normA <= theta[ii]:
-                F = _pade(A, m_vals[ii], sparse)
-                break
+    if _isdiag(A.indices, A.indptr, A.shape[0]):
+        A = sp.diags(np.exp(A.diagonal()), shape=A.shape, 
+                    format='csr', dtype=complex)
+        return A
+    if sparse:
+        E = spla.expm(A.tocsc())
     else:
-        t, s = np.frexp(normA / theta[-1])
-        s = s - (t == 0.5)
-        A = A / 2.0 ** s
-        F = _pade(A, m_vals[-1], sparse)
-        for i in range(s):
-            F = F * F
-
-    return F
-
-
-def _pade(A, m, sparse):
-    n = np.shape(A)[0]
-    c = _padecoeff(m)
-
-    if m != 13:
-        apows = [[] for jj in range(int(np.ceil((m + 1) / 2)))]
-        apows[0] = sp.eye(n, n, format='csc')
-        apows[1] = A * A
-        for jj in range(2, int(np.ceil((m + 1) / 2))):
-            apows[jj] = apows[jj - 1] * apows[1]
-        U = sp.lil_matrix((n, n)).tocsc()
-        V = sp.lil_matrix((n, n)).tocsc()
-        for jj in range(m, 0, -2):
-            U = U + c[jj] * apows[jj // 2]
-        U = A * U
-        for jj in range(m - 1, -1, -2):
-            V = V + c[jj] * apows[(jj + 1) // 2]
-
-        if sparse:
-            F = spla.spsolve((-U + V), (U + V))
-            return F.tocsr()
-        else:
-            F = la.solve((-U + V).todense(), (U + V).todense())
-            return sp.lil_matrix(F).tocsr()
-
-    elif m == 13:
-        A2 = A * A
-        A4 = A2 * A2
-        A6 = A2 * A4
-        U = A * (A6 * (c[13] * A6 + c[11] * A4 + c[9] * A2) +
-                 c[7] * A6 + c[5] * A4 + c[3] * A2 +
-                 c[1] * sp.eye(n, n).tocsc())
-        V = A6 * (c[12] * A6 + c[10] * A4 + c[8] * A2) + c[6] * A6 + c[4] * \
-            A4 + c[2] * A2 + c[0] * sp.eye(n, n).tocsc()
-
-        if sparse:
-            F = spla.spsolve((-U + V), (U + V))
-            return F.tocsr()
-        else:
-            F = la.solve((-U + V).todense(), (U + V).todense())
-            return sp.csr_matrix(F)
-
-
-def _padecoeff(m):
-    """
-    Private function returning coefficients for Pade approximation.
-    """
-    if m == 3:
-        return np.array([120, 60, 12, 1])
-    elif m == 5:
-        return np.array([30240, 15120, 3360, 420, 30, 1])
-    elif m == 7:
-        return np.array([17297280, 8648640, 1995840, 277200,
-                         25200, 1512, 56, 1])
-    elif m == 9:
-        return np.array([17643225600, 8821612800, 2075673600,
-                         302702400, 30270240, 2162160, 110880,
-                         3960, 90, 1])
-    elif m == 13:
-        return np.array([64764752532480000, 32382376266240000,
-                         7771770303897600, 1187353796428800,
-                         129060195264000, 10559470521600, 670442572800,
-                         33522128640, 1323241920, 40840800,
-                         960960, 16380, 182, 1])
+        E = spla.expm(A.toarray())
+    return sp.csr_matrix(E)
+    
 
 
 def sp_permute(A, rperm=(), cperm=(), safe=True):
@@ -519,7 +447,7 @@ def sp_permute(A, rperm=(), cperm=(), safe=True):
     data, ind, ptr = _sparse_permute(A.data, A.indices, A.indptr,
                                      nrows, ncols, rperm, cperm, flag)
     if kind == 'csr':
-        return sp.csr_matrix((data, ind, ptr), shape=shp, dtype=data.dtype)
+        return fast_csr_matrix((data, ind, ptr), shape=shp)
     elif kind == 'csc':
         return sp.csc_matrix((data, ind, ptr), shape=shp, dtype=data.dtype)
 
@@ -575,7 +503,7 @@ def sp_reverse_permute(A, rperm=(), cperm=(), safe=True):
                                              nrows, ncols, rperm, cperm, flag)
 
     if kind == 'csr':
-        return sp.csr_matrix((data, ind, ptr), shape=shp, dtype=data.dtype)
+        return fast_csr_matrix((data, ind, ptr), shape=shp)
     elif kind == 'csc':
         return sp.csc_matrix((data, ind, ptr), shape=shp, dtype=data.dtype)
 
@@ -642,3 +570,22 @@ def sp_profile(A):
         raise TypeError('Input sparse matrix must be in CSR or CSC format.')
 
     return up+lp, lp, up
+
+
+def sp_isdiag(A):
+    """Determine if sparse CSR matrix is diagonal.
+    
+    Parameters
+    ----------
+    A : csr_matrix, csc_matrix
+        Input matrix
+        
+    Returns
+    -------
+    isdiag : int
+        True if matix is diagonal, False otherwise.
+    
+    """
+    if not sp.isspmatrix_csr(A):
+        raise TypeError('Input sparse matrix must be in CSR format.')
+    return _isdiag(A.indices, A.indptr, A.shape[0])

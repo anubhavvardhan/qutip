@@ -41,10 +41,13 @@
 
 """
 Tests for main control.pulseoptim methods
+Some associated objects also tested.
 """
 from __future__ import division
 
 import os
+import uuid
+import shutil
 import numpy as np
 from numpy.testing import (
     assert_, assert_almost_equal, run_module_suite, assert_equal)
@@ -69,9 +72,26 @@ class TestPulseOptim:
     A test class for the QuTiP functions for generating quantum gates
     """
     
-    def test_unitary(self):
+    def setUp(self):
+        # list of file paths to be removed after test
+        self.tmp_files = []
+        # list of folder paths to be removed after test
+        self.tmp_dirs = [] 
+    
+    def tearDown(self):
+        for f in self.tmp_files:
+            try:
+                os.remove(f)
+            except:
+                pass
+            
+        for d in self.tmp_dirs:
+            shutil.rmtree(d, ignore_errors=True)
+            
+            
+    def test_01_1_unitary_hadamard(self):
         """
-        Optimise pulse for Hadamard and QFT gate with linear initial pulses
+        control.pulseoptim: Hadamard gate with linear initial pulses
         assert that goal is achieved and fidelity error is below threshold
         """
         # Hadamard
@@ -81,7 +101,7 @@ class TestPulseOptim:
         U_targ = hadamard_transform(1)
 
         n_ts = 10
-        evo_time = 6
+        evo_time = 10
         
         # Run the optimisation
         result = cpo.optimize_pulse_unitary(H_d, H_c, U_0, U_targ, 
@@ -94,7 +114,22 @@ class TestPulseOptim:
                     result.termination_reason, result.fid_err))
         assert_almost_equal(result.fid_err, 0.0, decimal=10, 
                             err_msg="Hadamard infidelity too high")
-                            
+                                    
+    def test_01_2_unitary_hadamard_no_stats(self):
+        """
+        control.pulseoptim: Hadamard gate with linear initial pulses (no stats)
+        assert that goal is achieved
+        """
+        # Hadamard
+        H_d = sigmaz()
+        H_c = [sigmax()]
+        U_0 = identity(2)
+        U_targ = hadamard_transform(1)
+
+        n_ts = 10
+        evo_time = 10
+        
+        # Run the optimisation                          
         #Try without stats
         result = cpo.optimize_pulse_unitary(H_d, H_c, U_0, U_targ, 
                         n_ts, evo_time, 
@@ -105,7 +140,46 @@ class TestPulseOptim:
                                             "(no stats). "
                     "Terminated due to: {}, with infidelity: {}".format(
                     result.termination_reason, result.fid_err))
-                                            
+
+    def test_01_3_unitary_hadamard_tau(self):
+        """
+        control.pulseoptim: Hadamard gate with linear initial pulses (tau)
+        assert that goal is achieved
+        """
+        # Hadamard
+        H_d = sigmaz()
+        H_c = [sigmax()]
+        U_0 = identity(2)
+        U_targ = hadamard_transform(1)
+        
+        # Run the optimisation                   
+        #Try setting timeslots with tau array
+        tau = np.arange(1.0, 10.0, 1.0)
+        result = cpo.optimize_pulse_unitary(H_d, H_c, U_0, U_targ, 
+                        tau=tau, 
+                        fid_err_targ=1e-10, 
+                        init_pulse_type='LIN', 
+                        gen_stats=False)
+        assert_(result.goal_achieved, msg="Hadamard goal not achieved "
+                                            "(tau as timeslots). "
+                    "Terminated due to: {}, with infidelity: {}".format(
+                    result.termination_reason, result.fid_err))
+
+    def test_01_4_unitary_hadamard_qobj(self):
+        """
+        control.pulseoptim: Hadamard gate with linear initial pulses (Qobj)
+        assert that goal is achieved
+        """
+        # Hadamard
+        H_d = sigmaz()
+        H_c = [sigmax()]
+        U_0 = identity(2)
+        U_targ = hadamard_transform(1)
+
+        n_ts = 10
+        evo_time = 10
+        
+        # Run the optimisation
         #Try with Qobj propagation
         result = cpo.optimize_pulse_unitary(H_d, H_c, U_0, U_targ, 
                         n_ts, evo_time, 
@@ -118,7 +192,61 @@ class TestPulseOptim:
                     "Terminated due to: {}, with infidelity: {}".format(
                     result.termination_reason, result.fid_err))
         
-        # Check same result is achieved using the create objects method
+    def test_01_5_unitary_hadamard_oo(self):
+        """
+        control.pulseoptim: Hadamard gate with linear initial pulses (OO)
+        assert that goal is achieved and pulseoptim method achieves
+        same result as OO method
+        """
+        # Hadamard
+        H_d = sigmaz()
+        H_c = [sigmax()]
+        U_0 = identity(2)
+        U_targ = hadamard_transform(1)
+
+        n_ts = 10
+        evo_time = 10
+        
+        # Run the optimisation
+        optim = cpo.create_pulse_optimizer(H_d, H_c, U_0, U_targ, 
+                        n_ts, evo_time, 
+                        fid_err_targ=1e-10, 
+                        dyn_type='UNIT', 
+                        init_pulse_type='LIN', 
+                        gen_stats=True)
+        dyn = optim.dynamics
+
+        init_amps = optim.pulse_generator.gen_pulse().reshape([-1, 1])
+        dyn.initialize_controls(init_amps)
+
+        result_oo = optim.run_optimization()
+
+        # Run the pulseoptim func
+        result_po = cpo.optimize_pulse_unitary(H_d, H_c, U_0, U_targ, 
+                        n_ts, evo_time, 
+                        fid_err_targ=1e-10, 
+                        init_pulse_type='LIN', 
+                        gen_stats=True)
+        
+        assert_almost_equal(result_oo.fid_err, result_po.fid_err, decimal=10, 
+                            err_msg="OO and pulseoptim methods produce "
+                                    "different results for Hadamard")
+        
+    def test_01_6_unitary_hadamard_grad(self):
+        """
+        control.pulseoptim: Hadamard gate gradient check
+        assert that gradient approx and exact gradient match in tolerance 
+        """
+        # Hadamard
+        H_d = sigmaz()
+        H_c = [sigmax()]
+        U_0 = identity(2)
+        U_targ = hadamard_transform(1)
+
+        n_ts = 10
+        evo_time = 10
+        
+        # Create the optim objects
         optim = cpo.create_pulse_optimizer(H_d, H_c, U_0, U_targ, 
                         n_ts, evo_time, 
                         fid_err_targ=1e-10, 
@@ -135,15 +263,14 @@ class TestPulseOptim:
         grad = optim.fid_err_grad_wrapper
         x0 = dyn.ctrl_amps.flatten()
         grad_diff = check_grad(func, grad, x0)
-        assert_almost_equal(grad_diff, 0.0, decimal=7,
+        assert_almost_equal(grad_diff, 0.0, decimal=6,
                             err_msg="Unitary gradient outside tolerance")
 
-        result2 = optim.run_optimization()
-        assert_almost_equal(result.fid_err, result2.fid_err, decimal=10, 
-                            err_msg="Direct and indirect methods produce "
-                                    "different results for Hadamard")
-                                    
-        # QFT
+    def test_02_1_qft(self):
+        """
+        control.pulseoptim: QFT gate with linear initial pulses
+        assert that goal is achieved and fidelity error is below threshold
+        """
         Sx = sigmax()
         Sy = sigmay()
         Sz = sigmaz()
@@ -151,10 +278,13 @@ class TestPulseOptim:
         
         H_d = 0.5*(tensor(Sx, Sx) + tensor(Sy, Sy) + tensor(Sz, Sz))
         H_c = [tensor(Sx, Si), tensor(Sy, Si), tensor(Si, Sx), tensor(Si, Sy)]
-        #n_ctrls = len(H_c)
         U_0 = identity(4)
         # Target for the gate evolution - Quantum Fourier Transform gate
         U_targ = qft.qft(2)
+        
+        n_ts = 10
+        evo_time = 10
+        
         result = cpo.optimize_pulse_unitary(H_d, H_c, U_0, U_targ, 
                         n_ts, evo_time, 
                         fid_err_targ=1e-9, 
@@ -177,10 +307,151 @@ class TestPulseOptim:
         assert_((result2.final_amps >= -1.0).all() and 
                     (result2.final_amps <= 1.0).all(), 
                     msg="Amplitude bounds exceeded for QFT")
-                    
-    def test_state_to_state(self):
+        
+    def test_02_2_qft_bounds(self):
         """
-        Optimise pulse for state-to-state transfer with linear initial pulse
+        control.pulseoptim: QFT gate with linear initial pulses (bounds)
+        assert that amplitudes remain in bounds
+        """
+        Sx = sigmax()
+        Sy = sigmay()
+        Sz = sigmaz()
+        Si = 0.5*identity(2)
+        
+        H_d = 0.5*(tensor(Sx, Sx) + tensor(Sy, Sy) + tensor(Sz, Sz))
+        H_c = [tensor(Sx, Si), tensor(Sy, Si), tensor(Si, Sx), tensor(Si, Sy)]
+        U_0 = identity(4)
+        # Target for the gate evolution - Quantum Fourier Transform gate
+        U_targ = qft.qft(2)
+        
+        n_ts = 10
+        evo_time = 10
+
+        result = cpo.optimize_pulse_unitary(H_d, H_c, U_0, U_targ, 
+                        n_ts, evo_time, 
+                        fid_err_targ=1e-9, 
+                        amp_lbound=-1.0, amp_ubound=1.0,
+                        init_pulse_type='LIN', 
+                        gen_stats=True)
+        assert_((result.final_amps >= -1.0).all() and 
+                    (result.final_amps <= 1.0).all(), 
+                    msg="Amplitude bounds exceeded for QFT")
+        
+    def test_03_dumping(self):
+        """
+        control: data dumping
+        Dump out processing data, check file counts
+        """
+        N_EXP_OPTIMDUMP_FILES = 10
+        N_EXP_DYNDUMP_FILES = 49
+        
+        # Hadamard
+        H_d = sigmaz()
+        H_c = [sigmax()]
+        U_0 = identity(2)
+        U_targ = hadamard_transform(1)
+
+        n_ts = 1000
+        evo_time = 4
+        
+        dump_folder = str(uuid.uuid4())
+        qtrl_dump_dir = os.path.expanduser(os.path.join('~', dump_folder))
+        self.tmp_dirs.append(qtrl_dump_dir)
+        optim_dump_dir = os.path.join(qtrl_dump_dir, 'optim')
+        dyn_dump_dir = os.path.join(qtrl_dump_dir, 'dyn')
+        result = cpo.optimize_pulse_unitary(H_d, H_c, U_0, U_targ, 
+                        n_ts, evo_time, 
+                        fid_err_targ=1e-9, 
+                        init_pulse_type='LIN', 
+                        optim_params={'dumping':'FULL', 'dump_to_file':True, 
+                                    'dump_dir':optim_dump_dir},
+                        dyn_params={'dumping':'FULL', 'dump_to_file':True, 
+                                    'dump_dir':dyn_dump_dir},
+                        gen_stats=True)
+        
+        # check dumps were generated
+        optim = result.optimizer
+        dyn = optim.dynamics
+        assert_(optim.dump is not None, msg='optimizer dump not created')
+        assert_(dyn.dump is not None, msg='dynamics dump not created')
+        
+        # Count files that were output
+        nfiles = len(os.listdir(optim.dump.dump_dir))
+        assert_(nfiles == N_EXP_OPTIMDUMP_FILES, 
+                msg="{} optimizer dump files generated, {} expected".format(
+                    nfiles, N_EXP_OPTIMDUMP_FILES))
+                    
+        nfiles = len(os.listdir(dyn.dump.dump_dir))
+        assert_(nfiles == N_EXP_DYNDUMP_FILES, 
+                msg="{} dynamics dump files generated, {} expected".format(
+                    nfiles, N_EXP_DYNDUMP_FILES))
+                    
+        # dump all to specific file stream
+        fpath = os.path.expanduser(os.path.join('~', str(uuid.uuid4())))
+        self.tmp_files.append(fpath)
+        with open(fpath, 'wb') as f:
+            optim.dump.writeout(f)
+        
+        assert_(os.stat(fpath).st_size > 0, 
+                msg="Nothing written to optimizer dump file")
+        
+        fpath = os.path.expanduser(os.path.join('~', str(uuid.uuid4())))
+        self.tmp_files.append(fpath)
+        with open(fpath, 'wb') as f:
+            dyn.dump.writeout(f)
+        assert_(os.stat(fpath).st_size > 0, 
+                msg="Nothing written to dynamics dump file")
+                   
+    def test_04_unitarity(self):
+        """
+        control: unitarity checking (via dump)
+        Dump out processing data and use to check unitary evolution
+        """
+       
+        # Hadamard
+        H_d = sigmaz()
+        H_c = [sigmax()]
+        U_0 = identity(2)
+        U_targ = hadamard_transform(1)
+
+        n_ts = 1000
+        evo_time = 4
+        
+        result = cpo.optimize_pulse_unitary(H_d, H_c, U_0, U_targ, 
+                        n_ts, evo_time, 
+                        fid_err_targ=1e-9, 
+                        init_pulse_type='LIN', 
+                        dyn_params={'dumping':'FULL'},
+                        gen_stats=True)
+        
+        # check dumps were generated
+        optim = result.optimizer
+        dyn = optim.dynamics
+        assert_(dyn.dump is not None, msg='dynamics dump not created')
+        
+        # Use the dump to check unitarity of all propagators and evo_ops
+        dyn.unitarity_tol = 1e-14
+        nu_prop = 0
+        nu_fwd_evo = 0
+        nu_onto_evo = 0
+        for d in dyn.dump.evo_dumps:
+            for k in range(dyn.num_tslots):
+                if not dyn._is_unitary(d.prop[k]): nu_prop += 1
+                if not dyn._is_unitary(d.fwd_evo[k]): nu_fwd_evo += 1
+                if not dyn._is_unitary(d.onto_evo[k]): nu_onto_evo += 1
+        assert_(nu_prop==0, 
+                msg="{} propagators found to be non-unitary".format(nu_prop))
+        assert_(nu_fwd_evo==0, 
+                msg="{} fwd evo ops found to be non-unitary".format(
+                                                                nu_fwd_evo))
+        assert_(nu_onto_evo==0,
+                msg="{} onto evo ops found to be non-unitary".format(
+                                                                nu_onto_evo))
+        
+    def test_05_1_state_to_state(self):
+        """
+        control.pulseoptim: state-to-state transfer 
+        linear initial pulse used
         assert that goal is achieved
         """       
         # 2 qubits with Ising interaction
@@ -215,7 +486,34 @@ class TestPulseOptim:
                     result.termination_reason, result.fid_err))
         assert_almost_equal(result.fid_err, 0.0, decimal=10, 
                             err_msg="Hadamard infidelity too high")
-                            
+                                    
+    def test_05_2_state_to_state_qobj(self):
+        """
+        control.pulseoptim: state-to-state transfer (Qobj)
+        linear initial pulse used
+        assert that goal is achieved
+        """       
+        # 2 qubits with Ising interaction
+        # some arbitary coupling constants
+        alpha = [0.9, 0.7]
+        beta  = [0.8, 0.9]
+        Sx = sigmax()
+        Sz = sigmaz()
+        H_d = (alpha[0]*tensor(Sx,identity(2)) + 
+              alpha[1]*tensor(identity(2),Sx) +
+              beta[0]*tensor(Sz,identity(2)) +
+              beta[1]*tensor(identity(2),Sz))
+        H_c = [tensor(Sz,Sz)]
+        
+        q1_0 = q2_0 = Qobj([[1], [0]])
+        q1_T = q2_T = Qobj([[0], [1]])
+        
+        psi_0 = tensor(q1_0, q2_0)
+        psi_T = tensor(q1_T, q2_T)
+        
+        n_ts = 10
+        evo_time = 18
+                                   
         #Try with Qobj propagation
         result = cpo.optimize_pulse_unitary(H_d, H_c, psi_0, psi_T, 
                         n_ts, evo_time, 
@@ -228,9 +526,10 @@ class TestPulseOptim:
                     "Terminated due to: {}, with infidelity: {}".format(
                     result.termination_reason, result.fid_err))
                                             
-    def test_lindbladian(self):
+    def test_06_lindbladian(self):
         """
-        Optimise pulse for amplitude damping channel with Lindbladian dyn
+        control.pulseoptim: amplitude damping channel
+        Lindbladian dynamics
         assert that fidelity error is below threshold
         """
 
@@ -306,9 +605,9 @@ class TestPulseOptim:
                             err_msg="Direct and indirect methods produce "
                                     "different results for ADC")
 
-    def test_symplectic(self):
+    def test_07_symplectic(self):
         """
-        Optimise pulse for coupled oscillators with Symplectic dynamics
+        control.pulseoptim: coupled oscillators (symplectic dynamics)
         assert that fidelity error is below threshold
         """
         g1 = 1.0
@@ -403,9 +702,9 @@ class TestPulseOptim:
                             err_msg="Direct and indirect methods produce "
                                     "different results for Symplectic")
                                     
-    def test_crab(self):
+    def test_08_crab(self):
         """
-        Optimise pulse for Hadamard gate using CRAB algorithm
+        control.pulseoptim: Hadamard gate using CRAB algorithm
         Apply guess and ramping pulse
         assert that goal is achieved and fidelity error is below threshold
         assert that starting amplitude is zero
@@ -460,9 +759,9 @@ class TestPulseOptim:
                     "Terminated due to: {}, with infidelity: {}".format(
                     result.termination_reason, result.fid_err))
                     
-    def test_load_params(self):
+    def test_09_load_params(self):
         """
-        Optimise pulse for Hadamard gate by loading config from file
+        control.pulseoptim: Hadamard gate (loading config from file)
         compare with result produced by pulseoptim method
         """
         H_d = sigmaz()
@@ -530,9 +829,9 @@ class TestPulseOptim:
                             err_msg="Pulses do not match")
                             
     
-    def test_init_pulse_params(self):
+    def test_10_init_pulse_params(self):
         """
-        Test setting pulse_params using create_pulse_optimizer
+        control.pulsegen: Check periodic control functions
         """
         
         def count_waves(n_ts, evo_time, ptype, freq=None, num_waves=None):
@@ -590,7 +889,68 @@ class TestPulseOptim:
                 assert_equal(exp_num_waves, fnd_num_waves, err_msg=
                     "Number of waves incorrect for pulse type '{}', "
                     "num_waves {}".format(ptype, num_waves))
+                    
+    def test_11_time_dependent_drift(self):
+        """
+        control.pulseoptim: Hadamard gate with fixed and time varying drift
+        assert that goal is achieved for both and that different control
+        pulses are produced (only) when they should be
+        """
+        # Hadamard
+        H_0 = sigmaz()
+        H_c = [sigmax()]
+        U_0 = identity(2)
+        U_targ = hadamard_transform(1)
+
+        n_ts = 20
+        evo_time = 10
         
+        drift_amps_flat = np.ones([n_ts], dtype=float)
+        dript_amps_step = [np.round(float(k)/n_ts) for k in range(n_ts)]
+        
+        # Run the optimisations
+        result_fixed = cpo.optimize_pulse_unitary(H_0, H_c, U_0, U_targ, 
+                        n_ts, evo_time, 
+                        fid_err_targ=1e-10, 
+                        init_pulse_type='LIN', 
+                        gen_stats=True)
+        assert_(result_fixed.goal_achieved, 
+                    msg="Fixed drift goal not achieved. "
+                    "Terminated due to: {}, with infidelity: {}".format(
+                    result_fixed.termination_reason, result_fixed.fid_err))
+                    
+        H_d = [drift_amps_flat[k]*H_0 for k in range(n_ts)]
+        result_flat = cpo.optimize_pulse_unitary(H_d, H_c, U_0, U_targ, 
+                        n_ts, evo_time, 
+                        fid_err_targ=1e-10, 
+                        init_pulse_type='LIN', 
+                        gen_stats=True)
+        assert_(result_flat.goal_achieved, msg="Flat drift goal not achieved. "
+                    "Terminated due to: {}, with infidelity: {}".format(
+                    result_flat.termination_reason, result_flat.fid_err))
+                    
+        # Check fixed and flat produced the same pulse
+        assert_almost_equal(result_fixed.final_amps, result_flat.final_amps, 
+                            decimal=9, 
+                            err_msg="Flat and fixed drift result in "
+                                    "different control pules")
+                            
+        H_d = [dript_amps_step[k]*H_0 for k in range(n_ts)]
+        result_step = cpo.optimize_pulse_unitary(H_d, H_c, U_0, U_targ, 
+                        n_ts, evo_time, 
+                        fid_err_targ=1e-10, 
+                        init_pulse_type='LIN', 
+                        gen_stats=True)
+        assert_(result_step.goal_achieved, msg="Step drift goal not achieved. "
+                    "Terminated due to: {}, with infidelity: {}".format(
+                    result_step.termination_reason, result_step.fid_err))
+                    
+        # Check step and flat produced different results
+        assert_(np.any(
+            np.abs(result_flat.final_amps - result_step.final_amps) > 1e-3), 
+                            msg="Flat and step drift result in "
+                                    "the same control pules")
+                                    
 if __name__ == "__main__":
     run_module_suite()
     
